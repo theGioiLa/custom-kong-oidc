@@ -1,0 +1,108 @@
+local BasePlugin = require "kong.plugins.base_plugin"
+local OidcHandler = BasePlugin:extend()
+local utils = require("kong.plugins.oidc.utils")
+local filter = require("kong.plugins.oidc.filter")
+local session = require("kong.plugins.oidc.session")
+
+OidcHandler.PRIORITY = 1000
+
+
+function OidcHandler:new()
+  OidcHandler.super.new(self, "oidc")
+end
+
+function OidcHandler:access(config)
+  OidcHandler.super.access(self)
+  local oidcConfig = utils.get_options(config, ngx)
+
+  if filter.shouldProcessRequest(oidcConfig) then
+    session.configure(config)
+    handle(oidcConfig)
+  else
+    ngx.log(ngx.DEBUG, "OidcHandler ignoring request, path: " .. ngx.var.request_uri)
+  end
+
+  ngx.log(ngx.DEBUG, "OidcHandler done")
+end
+
+function handle(oidcConfig)
+  local response
+  if oidcConfig.introspection_endpoint then
+    response = introspect(oidcConfig)
+    if response then
+      utils.injectUser(response)
+    end
+  end
+
+  if response == nil then
+    response = make_oidc(oidcConfig)
+    if response then
+      if (response.user) then
+        utils.injectUser(response.user)
+      end
+      -- if (response.access_token) then
+        -- utils.injectAccessToken(response.access_token)
+      -- end
+      -- if (response.id_token) then
+        -- utils.injectIDToken(response.id_token)
+      -- end
+    end
+  end
+
+	if (response) then
+		local user = response
+		if response.user ~= nil then user = response.user end
+		-- local user_roles = utils.get_roles(user)
+		if not authZ_by_roles(user.roles, oidcConfig.match_roles) then 
+			utils.error({
+				status = ngx.HTTP_UNAUTHORIZED,
+				message =  string.format("You don't have authority to access this path: %s", ngx.var.request_uri)
+			})
+		end
+		
+		ngx.log(ngx.INFO, "Authorized")
+	end
+end
+
+function authZ_by_roles(u_roles, match_roles) 
+	local u_role_flags = {}
+	for _, v in pairs(u_roles) do u_role_flags[v] = true end
+
+	for _, role in pairs(match_roles) do 
+		print(role)
+		if u_role_flags[role] then return true end
+	end
+	return false
+end
+
+function make_oidc(oidcConfig)
+  ngx.log(ngx.DEBUG, "OidcHandler calling authenticate, requested path: " .. ngx.var.request_uri)
+  local res, err = require("resty.openidc").authenticate(oidcConfig)
+  if err then
+    if oidcConfig.recovery_page_path then
+      ngx.log(ngx.DEBUG, "Entering recovery page: " .. oidcConfig.recovery_page_path)
+      ngx.redirect(oidcConfig.recovery_page_path)
+    end
+    utils.exit(500, err, ngx.HTTP_INTERNAL_SERVER_ERROR)
+  end
+  return res
+end
+
+function introspect(oidcConfig)
+  if utils.has_bearer_access_token() or oidcConfig.bearer_only == "yes" then
+    local res, err = require("resty.openidc").introspect(oidcConfig)
+    if err then
+      if oidcConfig.bearer_only == "yes" then
+        ngx.header["WWW-Authenticate"] = 'Bearer realm="' .. oidcConfig.realm .. '",error="' .. err .. '"'
+        utils.exit(ngx.HTTP_UNAUTHORIZED, err, ngx.HTTP_UNAUTHORIZED)
+      end
+      return nil
+    end
+    ngx.log(ngx.DEBUG, "OidcHandler introspect succeeded, requested path: " .. ngx.var.request_uri)
+    return res
+  end
+  return nil
+end
+
+
+return OidcHandler
